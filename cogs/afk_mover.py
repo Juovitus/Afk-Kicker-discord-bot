@@ -1,160 +1,105 @@
 import discord
 from discord.ext import commands
 import asyncio
-import sqlite3
+import aiosqlite
 import os
+import logging
 from dotenv import load_dotenv
 
 load_dotenv()
+
 ENABLE_WHITELIST = True
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
 class AFKMoverCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.pending_tasks = {}  # Dict to track pending move tasks: user_id -> task
+        self.pending_tasks = {}
         self.db_path = 'social_credit.db'
-        self.base_timer = int(os.getenv('AFK_TIMER_SECONDS', 5))
-        self.min_timer = 2
-        if ENABLE_WHITELIST :
-            self.whitelist = [int(id.strip()) for id in os.getenv('AFK_WHITELIST_USERS', '').split(',') if id.strip()]
-        else: self.whitelist = []
-        self.afk_channel_id = os.getenv('AFK_CHANNEL_ID')
-        self.afk_channel_id = int(self.afk_channel_id) if self.afk_channel_id else None
-        print(f"AFK Mover initialized: base_timer={self.base_timer}, min_timer={self.min_timer}, whitelist={self.whitelist}, afk_channel_id={self.afk_channel_id}")
 
-    def get_score(self, user_id):
-        try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            c.execute('SELECT score FROM scores WHERE user_id = ?', (user_id,))
-            result = c.fetchone()
-            conn.close()
-            score = result[0] if result else 0
-            #print(f"Fetched score for user {user_id}: {score}")
-            return score
-        except Exception as e:
-            print(f"Error fetching score for user {user_id}: {e}")
-            return 0
+        # Load timers
+        self.base_timer = int(os.getenv('AFK_TIMER_SECONDS', 300))
+        self.min_timer = int(os.getenv('AFK_MIN_TIMER_SECONDS', 60))
+        self.max_timer = int(os.getenv('AFK_MAX_TIMER_SECONDS', 900))  # new
 
-    def calculate_timer(self, user_id):
-        if user_id in self.whitelist:
-            #print(f"User {user_id} is whitelisted, skipping move")
-            return float('inf')  # Infinite timer for whitelisted users
-        score = self.get_score(user_id)
-        if score < 0:
-            reduction = abs(score) // 10
-            timer = self.base_timer - reduction
-            timer = max(timer, self.min_timer)
-            #print(f"User {user_id} has negative score {score}, timer reduced to {timer} seconds")
-            return timer
-        elif score > 0:
-            increase = (score // 10) * 30
-            timer = self.base_timer + increase
-            #print(f"User {user_id} has positive score {score}, timer increased to {timer} seconds")
-            return timer
-        #rint(f"User {user_id} has score 0, using base timer {self.base_timer} seconds")
-        return self.base_timer
-
-    async def get_afk_channel(self, guild):
-        if self.afk_channel_id:
-            channel = guild.get_channel(self.afk_channel_id)
-            if channel and isinstance(channel, discord.VoiceChannel):
-                return channel
-            else:
-                print(f"Custom AFK channel ID {self.afk_channel_id} not found or not a voice channel in guild {guild.id}")
-                return None
+        # Whitelist
+        if ENABLE_WHITELIST:
+            self.whitelist = self._parse_whitelist(os.getenv('AFK_WHITELIST_USERS', ''))
         else:
-            if guild.afk_channel:
-                #print(f"Using guild's AFK channel: {guild.afk_channel.name} (ID: {guild.afk_channel.id})")
-                return guild.afk_channel
-            else:
-                print(f"No AFK channel set for guild {guild.id}")
-                return None
+            self.whitelist = []
+
+        self.afk_channel_id = int(os.getenv('AFK_CHANNEL_ID', 0)) or None
+
+    def _parse_whitelist(self, raw):
+        whitelist = []
+        for entry in raw.split(','):
+            entry = entry.strip()
+            if entry.isdigit():
+                whitelist.append(int(entry))
+        return whitelist
+
+    async def get_score(self, user_id: int) -> int:
+        """Fetch a user's social credit score asynchronously."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT score FROM scores WHERE user_id = ?", (user_id,)) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else 0
+
+    async def start_move_timer(self, member: discord.Member):
+        """Starts the AFK move timer for a member."""
+        score = await self.get_score(member.id)
+        timer = self.base_timer + (score * 3)
+        timer = max(self.min_timer, min(timer, self.max_timer))  # enforce min/max
+
+        logging.info(f"Starting AFK timer for {member.display_name} ({timer}s, score={score})")
+
+        await asyncio.sleep(timer)
+
+        # Re-check before moving
+        if member.voice and member.voice.self_deaf:
+            afk_channel = self.get_afk_channel(member.guild)
+            if afk_channel and member.voice.channel != afk_channel:
+                await member.move_to(afk_channel, reason="Moved to AFK due to self-deafen timeout")
+                logging.info(f"Moved {member.display_name} to AFK channel.")
+        self.pending_tasks.pop(member.id, None)
+
+    def get_afk_channel(self, guild: discord.Guild):
+        """Get the AFK channel from ID or fallback."""
+        channel = guild.get_channel(self.afk_channel_id) if self.afk_channel_id else None
+        return channel or guild.afk_channel
 
     @commands.Cog.listener()
-    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState,
-                                    after: discord.VoiceState):
-        afk_channel = await self.get_afk_channel(member.guild)
-        if not afk_channel:
+    async def on_voice_state_update(self, member, before, after):
+        """Handles starting/stopping AFK timers based on voice state changes."""
+        # Ignore bots
+        if member.bot:
             return
 
-        if member.id in self.whitelist:
-            return  # Ignore whitelisted users
+        # Ignore whitelisted
+        if ENABLE_WHITELIST and member.id in self.whitelist:
+            return
 
-        async def _cancel_pending(uid):
-            task = self.pending_tasks.pop(uid, None)
-            if task:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-        # 1) Self-deaf state changed?
-        if before.self_deaf != after.self_deaf:
-            if after.self_deaf:
-                # user started self-deafening
-                #print(f"User {member.id} ({member.display_name}) self-deafened, checking timer")
-                await _cancel_pending(member.id)
-                timer = self.calculate_timer(member.id)
-                if timer == float('inf'):
-                    print(f"Infinite timer for user {member.id}, skipping move")
-                elif after.channel and after.channel != afk_channel:
-                    self.pending_tasks[member.id] = asyncio.create_task(self.deafen_timer(member, timer, afk_channel))
-            else:
-                # user stopped self-deafening -> cancel pending move
-                await _cancel_pending(member.id)
-                print(f"User {member.display_name} self-undeafened, cancelled task")
-
-        # 2) Joined a channel while already self-deafened
-        if before.channel is None and after.channel is not None:
-            if after.self_deaf and after.channel != afk_channel:
-                await _cancel_pending(member.id)
-                timer = self.calculate_timer(member.id)
-                if timer != float('inf'):
-                    self.pending_tasks[member.id] = asyncio.create_task(self.deafen_timer(member, timer, afk_channel))
-
-        # 3) Moved channels while deafened: cancel and restart if still deaf and not AFK
-        if before.channel != after.channel and member.id in self.pending_tasks:
-            await _cancel_pending(member.id)
-            #print(f"User {member.id} ({member.display_name}) moved channels, cancelled task")
-            if after.self_deaf and after.channel and after.channel != afk_channel:
-                timer = self.calculate_timer(member.id)
-                if timer != float('inf'):
-                    self.pending_tasks[member.id] = asyncio.create_task(self.deafen_timer(member, timer, afk_channel))
-
-        # 4) Left voice: cancel any pending task
-        if after.channel is None and member.id in self.pending_tasks:
-            await _cancel_pending(member.id)
-            print(f"User {member.id} ({member.display_name}) left voice, cancelled task")
-
-    async def deafen_timer(self, member: discord.Member, timer: float, afk_channel: discord.VoiceChannel):
-        try:
-            start_score = self.get_score(member.id)
-            print(f"Waiting {timer} seconds to move user to afk: {member.display_name} (Social Credit = {start_score})")
-            await asyncio.sleep(timer)
-
-            # Re-check score/state at move time if you want the most up-to-date value
-            current_score = self.get_score(member.id)
-
-            # After timer, check if still self-deafened and in a voice channel
-            if member.voice and member.voice.self_deaf:
-                #print(f"Attempting move: {member.display_name} (social_credit = {current_score})")
-                await member.move_to(afk_channel)
-                print(f"Moved {member.display_name} to AFK. (Social Credit = {current_score})")
-            else:
-                print(
-                    f"User {member.display_name} no longer self-deaf or in voice, not moving (score={current_score})")
-        except discord.errors.Forbidden:
-            print(
-                f"Missing permissions to move user {member.id} ({member.display_name}) to AFK channel {afk_channel.id}")
-        except discord.errors.HTTPException as e:
-            print(f"HTTP error moving user {member.id} ({member.display_name}): {e}")
-        except Exception as e:
-            print(f"Unexpected error moving user {member.id} ({member.display_name}): {e}")
-        finally:
+        # User starts self-deafening
+        if (after.self_deaf and not before.self_deaf) and member.voice:
+            # Cancel any existing timer
             if member.id in self.pending_tasks:
-                del self.pending_tasks[member.id]
+                self.pending_tasks[member.id].cancel()
 
+            # Start new timer
+            task = asyncio.create_task(self.start_move_timer(member))
+            self.pending_tasks[member.id] = task
+
+        # User undeafens or leaves VC
+        elif (before.self_deaf and not after.self_deaf) or not after.channel:
+            if member.id in self.pending_tasks:
+                self.pending_tasks[member.id].cancel()
+                self.pending_tasks.pop(member.id, None)
+                logging.info(f"Cancelled AFK timer for {member.display_name}.")
 
 async def setup(bot):
     await bot.add_cog(AFKMoverCog(bot))
